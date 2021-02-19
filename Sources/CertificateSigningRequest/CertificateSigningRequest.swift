@@ -33,6 +33,7 @@ import Foundation
 #if canImport(Security)
 import Security
 #endif
+import CryptoKit
 
 // swiftlint:disable:next type_body_length
 public class CertificateSigningRequest: NSObject {
@@ -44,6 +45,14 @@ public class CertificateSigningRequest: NSObject {
     private let objectOrganizationName: [UInt8] = [0x06, 0x03, 0x55, 0x04, 0x0A]
     private let objectOrganizationalUnitName: [UInt8] = [0x06, 0x03, 0x55, 0x04, 0x0B]
     private let objectStateOrProvinceName: [UInt8] = [0x06, 0x03, 0x55, 0x04, 0x08]
+    
+    private let objectExtensionRequest: [UInt8] = [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x0E]    // 1.2.840.113549.1.9.14
+    private let objectSubjectKeyIdentifier: [UInt8] = [0x06, 0x03, 0x55, 0x1D, 0x0E]    // 2.5.29.14
+    private let objectKeyUsage: [UInt8] = [0x06, 0x03, 0x55, 0x1D, 0x0F]                // 2.5.29.15
+    private let objectSubjectAlternativeName: [UInt8] = [0x06, 0x03, 0x55, 0x1D, 0x11]  // 2.5.29.17
+    private let objectBasicConstraints: [UInt8] = [0x06, 0x03, 0x55, 0x1D, 0x13]        // 2.5.29.19
+    private let objectExtendedKeyUsage: [UInt8] = [0x06, 0x03, 0x55, 0x1D, 0x25]        // 2.5.29.37
+    
     private let sequenceTag: UInt8 = 0x30
     private let setTag: UInt8 = 0x31
     private let commonName: String?
@@ -174,7 +183,7 @@ public class CertificateSigningRequest: NSObject {
     }
 
     func buldCertificationRequestInfo(_ publicKeyBits: Data) -> Data {
-        var certificationRequestInfo = Data(capacity: 256)
+        var certificationRequestInfo = Data(capacity: 1024)
 
         //Add version
         let version: [UInt8] = [0x02, 0x01, 0x00] // ASN.1 Representation of integer with value 1
@@ -183,35 +192,40 @@ public class CertificateSigningRequest: NSObject {
         //Add subject
         var subject = Data(capacity: 256)
 
-        if let countryName = countryName {
+        if countryName != "", let countryName = countryName {
             appendSubjectItem(objectCountryName, value: countryName, into: &subject)
         }
 
-        if let stateOrProvinceName = stateOrProvinceName {
+        if stateOrProvinceName != "", let stateOrProvinceName = stateOrProvinceName {
             appendSubjectItem(objectStateOrProvinceName, value: stateOrProvinceName, into: &subject)
         }
 
-        if let localityName = localityName {
+        if localityName != "", let localityName = localityName {
             appendSubjectItem(objectLocalityName, value: localityName, into: &subject)
         }
 
-        if let organizationName = organizationName {
+        if organizationName != "", let organizationName = organizationName {
             appendSubjectItem(objectOrganizationName, value: organizationName, into: &subject)
         }
 
-        if let organizationUnitName = organizationUnitName {
-            appendSubjectItem(objectOrganizationalUnitName, value: organizationUnitName, into: &subject)
+        if organizationUnitName != "", let organizationUnitName = organizationUnitName {
+            let units = organizationUnitName.split(separator: ";")
+            for unit in units {
+                let unit = String(unit).trimmingCharacters(in: .whitespacesAndNewlines)
+                appendSubjectItem(objectOrganizationalUnitName, value: unit, into: &subject)
+            }
         }
 
-        if let commonName = commonName {
+        if commonName != "", let commonName = commonName {
             appendSubjectItem(objectCommonName, value: commonName, into: &subject)
         }
 
-        if let emailAddress = emailAddress {
-            appendSubjectItem(objectEmailAddress, value: emailAddress, into: &subject)
+        if emailAddress != "", let emailAddress = emailAddress {
+            let email = String(emailAddress.split(separator: ";").first!).trimmingCharacters(in: .whitespacesAndNewlines)
+            appendSubjectItem(objectEmailAddress, value: email, into: &subject, encoding: .ascii)
         }
 
-        if let description = csrDescription {
+        if csrDescription != "", let description = csrDescription {
             appendSubjectItem(objectDescription, value: description, into: &subject)
         }
 
@@ -222,12 +236,18 @@ public class CertificateSigningRequest: NSObject {
         //Add public key info
         let publicKeyInfo = buildPublicKeyInfo(publicKeyBits)
         certificationRequestInfo.append(publicKeyInfo)
-
+                
         // Add attributes
-        let attributes: [UInt8] = [0xA0, 0x00]
-        certificationRequestInfo.append(attributes, count: attributes.count)
+        let extensionRequest = buildExtensionRequest(publicKeyBits)
+        if extensionRequest == nil {
+            certificationRequestInfo.append([0xA0, 0x00], count: 2)
+        } else {
+            certificationRequestInfo.append(0xA0)
+            appendDERLength(extensionRequest!.count, into: &certificationRequestInfo)
+            certificationRequestInfo.append(extensionRequest!)
+        }
+        
         enclose(&certificationRequestInfo, by: sequenceTag) // Enclose into SEQUENCE
-
         return certificationRequestInfo
     }
 
@@ -275,8 +295,91 @@ public class CertificateSigningRequest: NSObject {
 
         return publicKeyInfo
     }
+    
+    func buildExtensionRequest(_ publicKeyBits: Data) -> Data? {
+        var extensionRequest = Data()
+        extensionRequest.append(objectExtensionRequest, count: objectExtensionRequest.count)
+        var extensions = Data()
+        
+        // Key Usage
+        
+        var keyUsage = Data()
+        keyUsage.append(objectKeyUsage, count: objectKeyUsage.count)
+        appendBoolean(true, into: &keyUsage)
+        let keyUsageBits = Data([0x3,0x2,0x3,0x88])
+        appendOCTETSTRING(keyUsageBits, into: &keyUsage)
+        enclose(&keyUsage, by: sequenceTag)
+        extensions.append(keyUsage)
 
-    func appendSubjectItem(_ what: [UInt8], value: String, into: inout Data ) {
+        // Basic Constraints
+
+        var basicConstraint = Data()
+        //appendBoolean(false, into: &basicConstraint)
+        // if ca is true, add pathLenConstraint (integer)
+        enclose(&basicConstraint, by: sequenceTag)
+        let basicConstraints = buildExtension(objectBasicConstraints, extnValue: basicConstraint, critical: true)
+        extensions.append(basicConstraints)
+
+        // Subject Key Identifier
+
+        if #available(OSX 10.15, *) {
+            var publicKeyHash = Data()
+            publicKeyHash.append(0x04) // octet string type
+            publicKeyHash.append(0x14) // 20 bytes sha-1
+            publicKeyHash.append(contentsOf: Insecure.SHA1.hash(data: publicKeyBits))
+            let subjectKeyIdentifier = buildExtension(objectSubjectKeyIdentifier, extnValue: publicKeyHash)
+            extensions.append(subjectKeyIdentifier)
+
+        } else {
+            // Fallback on earlier versions
+        }
+
+        // Extended Key Usage
+
+        var ekus = Data()
+        ekus.append(contentsOf: [0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02]) // clientAuth
+        enclose(&ekus, by: sequenceTag)
+        let extendedKeyUsage = buildExtension(objectExtendedKeyUsage, extnValue: ekus)
+        extensions.append(extendedKeyUsage)
+
+        // Subject Alternative Names
+        
+        if emailAddress != "" {
+            var san = Data()
+            for email in emailAddress!.split(separator: ";") {
+                let email = String(email).trimmingCharacters(in: .whitespacesAndNewlines)
+                // 0x81 (tag class context-specific, 8th bit set, tag 1 for rfc8222 names)
+                san.append(0x81)
+                appendDERLength(email.lengthOfBytes(using: .ascii), into: &san)
+                san.append(email.data(using: .ascii)!)
+            }
+            enclose(&san, by: sequenceTag)
+                
+            let subjectAltNames = buildExtension(objectSubjectAlternativeName, extnValue: san)
+            extensions.append(subjectAltNames)
+        }
+        
+        // Wrap it up
+        
+        enclose(&extensions, by: sequenceTag)
+        enclose(&extensions, by: setTag)
+        extensionRequest.append(extensions)
+        enclose(&extensionRequest, by: sequenceTag)
+        return extensionRequest
+    }
+    
+    func buildExtension(_ extnId: [UInt8], extnValue: Data, critical: Bool? = nil) -> Data {
+        var extn = Data()
+        extn.append(extnId, count: extnId.count)
+        if critical != nil {
+            appendBoolean(critical!, into: &extn)
+        }
+        appendOCTETSTRING(extnValue, into: &extn)
+        enclose(&extn, by: sequenceTag)
+        return extn
+    }
+
+    func appendSubjectItem(_ what: [UInt8], value: String, into: inout Data, encoding: String.Encoding = .utf8) {
 
         if what.count != 5 && what.count != 11 {
             print("Error: appending to a non-subject item")
@@ -286,7 +389,11 @@ public class CertificateSigningRequest: NSObject {
         var subjectItem = Data(capacity: 128)
 
         subjectItem.append(what, count: what.count)
-        appendUTF8String(string: value, into: &subjectItem)
+        if encoding == .utf8 {
+            appendUTF8String(string: value, into: &subjectItem)
+        } else {
+            appendStringOfTagType(strType: 0x16, string: value, into: &subjectItem, encoding: encoding)
+        }
         enclose(&subjectItem, by: sequenceTag)
         enclose(&subjectItem, by: setTag)
 
@@ -300,6 +407,12 @@ public class CertificateSigningRequest: NSObject {
         into.append(strType)
         appendDERLength(string.lengthOfBytes(using: String.Encoding.utf8), into: &into)
         into.append(string.data(using: String.Encoding.utf8)!)
+    }
+    
+    func appendStringOfTagType(strType: UInt8, string: String, into: inout Data, encoding: String.Encoding = .utf8) {
+        into.append(strType)
+        appendDERLength(string.lengthOfBytes(using: encoding), into: &into)
+        into.append(string.data(using: encoding)!)
     }
 
     func appendDERLength(_ length: Int, into: inout Data) {
@@ -323,10 +436,26 @@ public class CertificateSigningRequest: NSObject {
             into.append(&dLength, count: dLength.count)
         }
     }
+    
+    func appendBoolean(_ value: Bool, into: inout Data) {
+        into.append(contentsOf: [0x01, 0x01])   //BOOLEAN w/length 1
+        if value {
+            into.append(0xff)
+        } else {
+            into.append(0x00)
+        }
+    }
 
     func appendBITSTRING(_ data: Data, into: inout Data) {
 
         let strType: UInt8 = 0x03 //BIT STRING
+        into.append(strType)
+        appendDERLength(data.count, into: &into)
+        into.append(data)
+    }
+    
+    func appendOCTETSTRING(_ data: Data, into: inout Data) {
+        let strType: UInt8 = 0x04 //OCTET STRING
         into.append(strType)
         appendDERLength(data.count, into: &into)
         into.append(data)
@@ -437,4 +566,5 @@ public class CertificateSigningRequest: NSObject {
 
         return ret
     }
+    
 } // swiftlint:disable:this file_length
